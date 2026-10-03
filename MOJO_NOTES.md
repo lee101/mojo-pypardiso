@@ -1,10 +1,21 @@
 # Mojo dialect notes (verified by probe against the pinned compiler, not by docs)
 
-Toolchain these notes describe: `mojo ==1.2.0.dev2026092605` (set in `MOJO_PIN` in
+Toolchain these notes describe: `mojo ==1.2.0.dev2026092905` (set in `MOJO_PIN` in
 `bin/port.sh`; every repo receives this file with the marker already substituted).
 Every claim below was checked by compiling it. `bin/probe-confirm.py` and
 `bin/probe-hints.py` in the factory regenerate the list; re-run them after any
 toolchain bump rather than trusting this file.
+
+## Pin note for this repo (mojo-pypardiso)
+
+This repo pins `mojo ==1.2.0.dev2026092605` / `max ==26.7.0.dev2026092605`, not
+the `...905` marker above. A `max` nightly of a given day only has builds for
+Python 3.10, 3.11, 3.12, 3.13 and 3.14, and `max-core` pins `mojo-compiler`
+exactly, so a `mojo` pin newer than the matching `max` is unsolvable — it comes
+back as `mojo-compiler ... conflicts with the versions reported above`. Pinning
+`mojo` to a newer day than `max` fails the install outright. `2026092605` is the
+newest pair with a Python 3.13 build and matches every sibling repo. Nothing in
+the dialect notes below depends on the patch number.
 
 ## 0. Two things that break everything if you forget them
 
@@ -144,8 +155,8 @@ pin; it is released in lockstep, so `mojo ==X` goes with `max ==matching-version
 
 ```toml
 [dependencies]
-mojo = "==1.2.0.dev2026092605"
-max  = "==26.7.0.dev2026092605"
+mojo = "==1.2.0.dev2026092905"
+max  = "==26.7.0.dev2026092905"
 ```
 
 **`parallelize` signature changed.** The bracket form no longer type-checks:
@@ -164,6 +175,12 @@ nested `{imm}` also works, which the chunked variants need.
 called from a ctypes host. `sync_parallelize` segfaulted from a ctypes host
 entirely; prefer `parallelize` with an explicit count, and gate it behind a size
 threshold.
+
+**Clamp the worker count to the work.** `parallelize(fn, num_work_items, num_workers)`
+with `num_workers > num_work_items` aborts from a ctypes host with
+`alloc failed: returned a null pointer` followed by SIGILL — it is not a clean
+error. Measured on 72 cores, `parallelize(fn, 3, 72)` aborts while
+`parallelize(fn, 3, 3)` is fine. Min the two before calling.
 
 **`max.gpu` exports** `block_dim`, `block_idx`, `thread_idx`, `global_idx`.
 `DeviceContext()` construction needs a `raises` context, the value is not
