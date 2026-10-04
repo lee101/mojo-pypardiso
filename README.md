@@ -5,10 +5,10 @@ direct solver, with the same Python API.
 
 Upstream `pypardiso` is a thin ctypes wrapper: it loads Intel MKL's `mkl_pardiso`
 and forwards every call to it. Almost nothing is computed in Python. This port
-keeps the Python surface byte-for-byte compatible and replaces the closed binary
-with a Mojo implementation of the same computation — a sparse LU factorisation of
-`P A` with partial pivoting, plus the triangular solves against the stored
-factors — compiled to `dist/libmojo-pypardiso.so` and called through ctypes.
+keeps the Python surface compatible and replaces the closed binary with a Mojo
+implementation of the same computation — a sparse LU factorisation of `P A` with
+partial pivoting, plus the triangular solves against the stored factors —
+compiled to `dist/libmojo-pypardiso.so` and called through ctypes.
 
 ## Install
 
@@ -62,9 +62,9 @@ reflecting over both modules and comparing signatures.
 ## What is covered, and what is not
 
 Everything in `pypardiso/pardiso_wrapper.py` and `pypardiso/scipy_aliases.py` is
-ported. There are three places where the port is not identical to upstream, all
-of them forced by MKL PARDISO being a proprietary binary rather than by anything
-Mojo cannot express.
+ported. There are four places where the port is not identical to upstream: three
+forced by MKL PARDISO being a proprietary binary, and one where upstream is
+silently wrong and this port is not.
 
 **1. `_call_pardiso`, phases 12/13 — the factorisation algorithm.**
 MKL runs a multifrontal supernodal solver with a fill-reducing ordering and
@@ -85,22 +85,27 @@ column, i.e. the diagonal whenever the column has one). The phase 22 `nnzf` is
 therefore exact for that static ordering and is usually *smaller* than the phase 13
 `nnzf`. `test_phase22_reports_the_static_ordering_fill` pins this behaviour: on a
 matrix that needs fill under numeric pivoting, phase 22 reports no fill and phase
-13 reports some.
+13 reports some. The structural pass also stores a placeholder `u_diag` of 1.0
+rather than a pivot, so a phase 22 factorisation must never be solved against;
+nothing does that, and `test_lu_factorize_symbolic_walk_builds_the_same_pattern_without_values`
+pins the difference.
 
 **3. `_check_A`, the CSC branch.**
 Upstream sets `iparm(12) = 1` and lets MKL apply the transposition internally.
 `mpp_csr_transpose` applies it explicitly instead. It is the same conversion
 `scipy.sparse.csc_matrix.tocsr()` performs — count, exclusive prefix sum,
 scatter — so `solve(csc, b)` and `solve(csr, b)` return identical results.
+`test_csc_input_matches_csr_input` pins that they are bit-for-bit equal.
 
-This is not only equivalent, it is more reliable than the upstream path. Feeding
-upstream a CSC matrix with a weak diagonal, so that partial pivoting has to
-interleave rows, it returns a wrong answer: on a deterministic 38x38 case its
-relative error against `numpy.linalg.solve` was 1.5, repeated identically over
-five runs, while the same matrix through its own CSR path was exact to 3e-15.
-This port returns 6e-15 for both. That is an upstream defect, not a
-compatibility break, but it means "identical results to upstream" is not
-achievable on this path and should not be claimed.
+**4. A structurally empty column raises here and is silently wrong upstream.**
+`_check_A` only tests `np.diff(A.indptr).all()`, so a square CSR matrix with no
+empty *row* but a column that holds no stored entries passes validation. This
+port's step 1 then walks that column, finds no candidate, and returns -2, so
+`solve()` raises `PyPardisoError(-2)`.
+`test_lu_factorize_reports_minus_two_on_a_structural_zero_pivot` pins the kernel's
+answer and `test_singular_matrix_raises_pardiso_error` pins what `solve()` does
+with it. A caller that depended on upstream's behaviour on a singular matrix
+would see a new exception here.
 
 Two smaller divergences, both consequences of the same thing:
 
@@ -123,11 +128,20 @@ scipy promotes a sparse matrix's `indptr`/`indices` to `int64` once the matrix i
 large enough, so both are narrowed on the way into the kernels and every kernel
 destination array is allocated at `int32`. This is hardening rather than a
 compatibility requirement: upstream hands the arrays straight to MKL, which reads
-them as `int32` too, so `int32` input already works there. But an `int64`-indexed
-CSC matrix reaching `mpp_csr_transpose` used to leave the high half of each index
-slot at whatever the destination buffer happened to hold, which is wrong indices
-rather than an error. `test_int64_index_arrays_are_narrowed_not_misread` pins the
+them as `int32` too. `test_int64_index_arrays_are_narrowed_not_misread` pins the
 behaviour on both formats and both widths.
+
+**Right-hand side layout.** `b` is handed to `mpp_permute_rhs` and
+`mpp_lu_solve` as one column-major buffer, so a non-contiguous right-hand side is
+materialised first. A 2D `b` that is not Fortran-contiguous becomes Fortran
+order, and a 1D `b` that is not C-contiguous — a strided view such as
+`v[::2]` — becomes contiguous. Upstream materialises 1D views too, via the
+`asfortranarray` it applies unconditionally and which is a no-op on 1D.
+`test_solve_handles_every_right_hand_side_stride` pins all three layouts.
+A sparse `b` is densified with `toarray` rather than upstream's `todense`: both
+hold the same values, but `todense` returns an `np.matrix` whose
+`flags.f_contiguous` is false for an `(n, 1)` result, which would silently turn a
+one-dimensional right-hand side into a column and return the wrong shape.
 
 ## How it works
 
@@ -141,6 +155,15 @@ the `argtypes` table; the Python layer allocates the numpy buffers and passes
 `.ctypes.data`. All allocation stays on the Python side — the kernels never
 allocate.
 
+The `argtypes` table is hand-written and nothing in the toolchain checks it, so
+`tests/test_kernels.py` parses the parameter list out of `src/ported.mojo` and
+compares it entry by entry against `_lib._SIGNATURES`. That is not ceremony: two
+errors in it were live at the time of writing. `mpp_lu_solve` declared eleven
+slots for a twelve-parameter kernel, so the extra `nworkers` argument was
+silently dropped and the solve read uninitialised stack as its worker count; and
+`mpp_csr_transpose`'s `cursor` was declared as a count rather than an address,
+which made every CSC solve write its scatter cursors through a null pointer.
+
 **Memory layout.** Everything is CSR and 0-based, matching `scipy.sparse`. Indices
 are `Int32`, values `Float64`. The factorisation is right-looking: it walks the
 columns in order and each step pushes the pivot row into the rows below it.
@@ -152,6 +175,16 @@ columns in order and each step pushes the pivot row into the rows below it.
   followed by one division.
 - `perm[k]` is the original row label that ends up at position `k`, so `P b` is
   the gather `b[perm]`. `mpp_permute_rhs` is that gather.
+
+Both `L` and `u_diag` are indexed by *pivot position*, which is what the
+factorisation writes them in. `perm` is a label lookup, not an index into either
+array; reading them through `perm` mixes two orderings up and produces a wrong
+answer. The port happens to permute with one kernel and solve with the other, so
+a mismatch between the two cancels and `solve` still returns the right vector.
+`test_lu_factorize_factors_solve_the_system_they_came_from` is the test that
+catches it: it feeds the factorisation's own factors into the solve kernel and
+checks the result against `A x == b`, which no consistent amount of
+mis-indexing survives.
 
 The factorisation works on a flat entry workspace. Each entry is threaded into
 both a row list and a column list, so a row and a column can be walked without
@@ -167,7 +200,14 @@ per multiplier, so the stamps need no clearing.
 The workspace must hold every input and fill entry the factorisation ever
 creates, and how many that is not known until it is built. The kernel returns
 `-3` when the workspace overflows and the Python side retries with four times the
-space; `-2` means a zero pivot, which upstream surfaces as `PyPardisoError(-2)`.
+space; `-2` means no candidate pivot in the column, which surfaces as
+`PyPardisoError(-2)` (see divergence 4 above for where that differs from
+upstream). Both returns are asserted against the kernel directly, in
+`test_lu_factorize_reports_minus_two_on_a_structural_zero_pivot`,
+`test_lu_factorize_reports_minus_two_on_a_numerically_zero_pivot` and
+`test_lu_factorize_reports_minus_three_when_the_workspace_is_too_small`, and the
+retry that answers `-3` is pinned by
+`test_lu_factorize_retry_recovers_and_the_python_side_drives_it`.
 
 **Threading.** `mpp_lu_solve` spreads independent right-hand sides over worker
 threads with `max.algorithm.parallelize`, which is where the capability lives in
@@ -176,8 +216,45 @@ clamped to the number of right-hand sides and gated behind a threshold, because
 `parallelize` with more workers than work items does not survive being called from
 a C host, and because below four right-hand sides the thread launch costs more
 than the solve. `MOJO_PYPARDISO_THREADS` overrides the count. The factorisation
-is single threaded; see the benchmarking section for why it cannot simply be
-made parallel without first changing its schedule.
+is single threaded: its steps are genuinely dependent, so spreading them over
+`parallelize` would need a different schedule (a left-looking Gilbert-Peierls
+ordering), which is a rewrite rather than a flag.
+
+**The cached-solve path.** `solve(A, b)` decides between phase 13 (factorise and
+solve) and phase 33 (solve against what is stored) by asking whether `A` is the
+matrix the stored factors came from. Upstream answers that with three
+element-by-element `np.array_equal` comparisons over `indptr`, `indices` and
+`data`, on every call.
+
+Object identity is a cheap way to answer it, and this port uses it — but only as
+a *guard in front of* the comparison, never instead of it. Identity alone is not
+trustworthy: a caller may mutate the matrix in place between solves, and scipy's
+sparse setters rewrite `data` in the same buffer without replacing it, so the
+object survives a matrix that is no longer the one that was factorised. Serving
+that matrix from the stored factors returns the solution of a different system
+with nothing to show that anything is wrong. This was not hypothetical: before
+the guard was added, `A[0, 0] = 30.0` between two `solve` calls on the same
+object returned the old solution with a residual of 9.0 where upstream returns
+the correct one.
+
+The guard is therefore: same object, *and* small enough that the comparison which
+follows is guaranteed to have read every element of the matrix. Above that
+threshold the identity is not used at all and every call takes the full
+comparison, which is what upstream does unconditionally. The threshold is
+`nnz <= 4096` (`_WARM_MIN_NNZ`). The bound is not arbitrary in the other
+direction either: on a cache-missed array the comparison can read from main
+memory while the array is being rewritten by the caller's in-place edit, and so
+see the old bytes, so `_lib.WARM` walks the array first to pin its pages and
+load them. On a dense 500x500 matrix that walk costs about 424 us against about
+274 us for the comparison it protects — which is why the fast path only pays
+below the threshold, where the walk is small enough to be noise against a solve.
+
+`tests/test_parity.py` pins this in both directions: that a repeated `solve` on
+the same small object still takes phase 33 and gives the same answer as a fresh
+solver, that the same object above the threshold still reaches phase 33 by the
+other route, that an in-place mutation is *not* taken as factorised, that
+releasing the factorisation clears the recorded object, and that an
+equal-but-distinct matrix is handled by the comparison rather than the identity.
 
 ## Tests
 
@@ -185,7 +262,7 @@ made parallel without first changing its schedule.
 pixi run test
 ```
 
-113 tests, all asserting numerical or behavioural parity rather than "it ran":
+151 tests, all asserting numerical or behavioural parity rather than "it ran":
 
 - `L @ U == A[perm]` to machine precision for ten matrix shapes (1x1 through
   300x300, tridiagonal, 2D Laplacian, random sparse, weakly diagonal so pivoting
@@ -195,25 +272,62 @@ pixi run test
 - Relative residual `||A x - b|| / ||b|| < 1e-10`, independent of any other solver.
 - A randomised sweep of four structural families (well conditioned, weak diagonal
   with forced pivoting, tridiagonal, pentadiagonal) in both CSR and CSC, against
-  `numpy.linalg.solve`. Over 200 such cases the worst relative error observed
-  was `1.5e-13`, with no exceptions. Upstream MKL PARDISO is deliberately not
-  the oracle here, because it is wrong on the CSC path for a pivoting-heavy
-  matrix; see the CSC branch note above.
+  `numpy.linalg.solve`. Upstream MKL PARDISO is deliberately not the oracle here,
+  because on a CSC matrix from this family it returned a solution with a residual
+  of order 4 while the CSR path on the same matrix was exact; the check is
+  against a dense solve instead.
 - Right-hand sides passed as C-contiguous, Fortran-contiguous and strided views,
   across 1, 2 and 5 right-hand sides, all agreeing with `numpy.linalg.solve`.
 - `int32` and `int64` index arrays on both the CSR and the CSC path.
-- Each kernel called directly through ctypes and checked against its definition:
-  `mpp_csr_transpose` against `csc_matrix.tocsr()`, `mpp_indptr_diffs` against
-  `np.diff`, `mpp_permute_rhs` against the gather, threaded against serial solve.
-- The phase 22 structural walk and the numeric walk are asserted to produce
-  identical index patterns on a matrix whose two pivot rules agree, and a
-  matrix that provably creates fill is checked for `L @ U == A[perm]` so the
-  fill-appending branch of the rank-one update is covered.
+- **Every one of the five exported kernels called by name through ctypes**, with
+  the test allocating and sizing its own buffers, in `tests/test_kernels.py`:
+  - `mpp_indptr_diffs` against `np.diff`, at `n` of 0, 1 and 64.
+  - `mpp_csr_transpose` against `csc_matrix.tocsr()`, against its own `-1`
+    entry-count guard, and on an input with duplicate entries that it must
+    reindex rather than coalesce.
+  - `mpp_permute_rhs` against a manual gather, for 1, 2 and 5 right-hand sides,
+    and with the identity permutation into a poisoned destination.
+  - `mpp_lu_factorize` against `L @ U == A[perm]`, against its `-2` returns (a
+    structurally empty column and a numerically zero pivot) and its `-3` return,
+    against `perm[0]` naming the largest-magnitude row, against `nnzf` counting
+    every stored entry once, against each U row coming out sorted by column, on a
+    1x1 matrix, and on the structural walk that shares its pivot rule.
+  - `mpp_lu_solve` against `numpy.linalg.solve(L @ U, b)` on factors the test
+    packs itself, for 1, 3 and 6 right-hand sides; against `b` being left
+    untouched; against the column-major layout of a 3-column right-hand side;
+    against `x` being fully written when the right-hand side is zero; and serial
+    against threaded.
+  - The cross-kernel contract: `mpp_lu_factorize`'s factors fed through
+    `mpp_permute_rhs` and `mpp_lu_solve`, checked against `A x == b`.
+  - `_lib._SIGNATURES` compared against the parameter lists parsed out of
+    `src/ported.mojo`, entry by entry, in both directions: a buffer parameter
+    must be a `c_void_p` and a count parameter must not be.
 - API equivalence with upstream by reflection: exported names, public method set,
   parameter names and defaults for every public method.
 - Every documented error path: non-square, non-CSR/CSC, non-float64, empty rows
   and columns, dimension mismatch, unsupported dtype, singular matrix, phase 33
   with no stored factorisation.
+
+**The tests cannot pass without the compiled library.** Every test is gated on a
+`compiled_lib` fixture that force-rebuilds `src/ported.mojo`, asserts the loaded
+`CDLL` really is `dist/libmojo-pypardiso.so`, and `pytest.skip`s loudly if the
+build fails or the `.so` is absent. Pointing the toolchain at a missing compiler
+turns almost all of the tests into skips with the reason printed, rather than
+letting a pure-Python path satisfy them:
+
+```
+$ MOJO_PYPARDISO_MOJO=/nonexistent/mojo pixi run test
+2 passed, 149 skipped
+```
+
+The two tests that still run without the library are the two that never call a
+kernel: `test_ctypes_argtypes_match_the_declared_kernel_signatures` compares the
+`argtypes` table against the Mojo *source*, and
+`test_indptr_diff_kernel_finds_the_empty_row` asks for neither the
+`compiled_lib` nor the `ours` fixture, so it goes on to load whatever
+`dist/libmojo-pypardiso.so` is already there and calls it. Neither can satisfy a
+claim about kernel behaviour; they survive the missing toolchain by not being
+gated on it, and neither replaces the gated tests that do.
 
 ## Benchmarks
 
@@ -225,151 +339,87 @@ The `flock` waits up to 900 s for the shared lock and then gives up rather than
 hanging forever; if it times out, exit status 1 and no table is produced. The
 lock is machine-wide and shared with other checkouts, so a long-running job
 elsewhere can hold it; `pixi run bench-nolock` runs the identical benchmark
-without it, for when that happens. The run below was taken on a free lock with a
-load average near 83 on 72 logical CPUs from other jobs, so every number here is
-a measurement under contention rather than an idle-machine figure.
+without it, for when that happens.
 
-Across three full runs of this benchmark, the `mojo-pypardiso` column varied by at
-most 1.24x and the upstream column by at most 1.71x, so both are noisy to roughly
-that degree and any single ratio within about 1.5x of parity should not be read as
-a win in either direction. The banded case wins decisively on every run
-(0.07x-0.14x). The `spsolve` alias case is the marginal one: it landed at 0.79x,
-1.28x and 1.01x across the three runs, so it is a wash rather than a result. The
-dense and Laplacian cases lose by margins far larger than the noise.
+**This machine is shared and the noise is large.** Eight full runs of this
+benchmark were taken on this machine while preparing this table, each with a
+load average between 68 and 137 on 72 logical CPUs. Individual cells move a
+lot — the upstream column alone ranged from 18.81 ms to 75.33 ms on
+`dense 200x200` and from 36.04 ms to 155.19 ms on the Laplacian. Treat the ratio
+column as indicative, not precise. The table below gives the ratio range
+observed across those runs; `n` is how many of them measured that case, which is
+lower for some only because three of the early runs were cut short by the 900 s
+`flock` timeout before reaching them.
 
-The table below is one complete run, reproduced verbatim.
+| case | n | ratio range | |
+| --- | --- | --- | --- |
+| solve: banded 20000 | 7 | 0.01x - 0.05x | a win on every run |
+| spsolve alias: laplacian 60x60 | 4 | 0.07x - 0.18x | a win on every run |
+| solve cached: dense 500x500, 8 rhs | 7 | 0.60x - 1.27x | around parity, on both sides |
+| solve: dense 200x200 | 7 | 0.36x - 1.37x | on or near parity, on both sides |
+| solve: dense 400x400 | 7 | 2.10x - 5.23x | a loss that grows with `n` |
+| solve: dense 500x500, 32 rhs | 7 | 2.10x - 4.51x | a stable loss |
+| factorize: dense 800x800 | 7 | 7.82x - 11.57x | a stable loss |
+| solve: dense 800x800 | 7 | 5.47x - 10.06x | a loss that grows with `n` |
+| solve: laplacian 80x80 | 7 | 9.73x - 33.52x | the worst row on every run |
 
 ```
-machine: Intel(R) Xeon(R) CPU E5-2697 v4 @ 2.30GHz, 72 logical CPUs,
-         Python 3.13.15, numpy 2.5.3
+machine: Intel(R) Xeon(R) CPU E5-2697 v4 @ 2.30GHz, 72 logical CPUs, Python 3.13.15, numpy 2.5.3
 ```
 
 | case | mojo-pypardiso | upstream pypardiso (MKL) | ratio |
 | --- | --- | --- | --- |
-| solve: banded 20000 (1 rhs) | 3.69 ms | 33.64 ms | 0.11x |
-| spsolve alias: laplacian 60x60 (3600) | 1.10 ms | 0.85 ms | 1.28x |
-| solve: dense 200x200 (1 rhs) | 21.98 ms | 13.45 ms | 1.63x |
-| solve: dense 400x400 (1 rhs) | 156.56 ms | 27.21 ms | 5.75x |
-| solve: dense 500x500, 32 rhs | 302.29 ms | 57.67 ms | 5.24x |
-| solve: dense 800x800 (1 rhs) | 1255.61 ms | 136.46 ms | 9.20x |
-| factorize: dense 800x800 | 1244.73 ms | 99.94 ms | 12.45x |
-| solve: laplacian 80x80 grid (6400) | 785.48 ms | 28.40 ms | 27.66x |
-| phase 22 analysis: dense 800x800 | 1147.37 ms | crashed | - |
+| solve: dense 200x200 (1 rhs) | 28.40 ms | 20.68 ms | 1.37x |
+| solve: dense 400x400 (1 rhs) | 281.11 ms | 101.01 ms | 2.78x |
+| solve: dense 800x800 (1 rhs) | 2430.36 ms | 291.71 ms | 8.33x |
+| factorize: dense 800x800 | 2220.84 ms | 236.24 ms | 9.40x |
+| solve: dense 500x500, 32 rhs | 575.05 ms | 127.53 ms | 4.51x |
+| solve: banded 20000 (1 rhs) | 5.07 ms | 102.52 ms | 0.05x |
+| solve: laplacian 80x80 grid (6400) | 1502.64 ms | 81.20 ms | 18.50x |
+| spsolve alias: laplacian 60x60 (3600) | 1.17 ms | 6.56 ms | 0.18x |
+| solve cached: dense 500x500, 8 rhs | 14.31 ms | 11.27 ms | 1.27x |
+| phase 22 analysis: dense 800x800 | 1876.64 ms | crashed | - |
 
-One of the eight comparable cases in this run is faster than upstream MKL
-PARDISO, the banded case by a wide margin. The `spsolve` alias row landed on the
-losing side here at 1.28x but won the next run at 0.79x, so treat it as a wash.
-The ratios above 1 are losses, stated as they came out.
-
-### Where the time goes
-
-Profiling each stage separately (`bench/profile_kernels.py`) shows the
-factorisation is essentially the whole runtime. A representative run:
-
-| stage | dense 800 | laplacian 80x80 |
-| --- | --- | --- |
-| whole `solve()` | 1844.6 ms | 781.5 ms |
-| `mpp_lu_factorize` (`_analyze`, numeric) | 2444.1 ms | 801.3 ms |
-| of which `np.zeros` allocation | 7.0 ms | 0.2 ms |
-| `mpp_permute_rhs` | 0.011 ms | 0.011 ms |
-| `mpp_lu_solve` (triangular solves) | 1.24 ms | 1.87 ms |
-
-(The `_analyze` column is timed on its own and so can exceed the whole `solve()`
-column: it is the cold-cache single call, whereas `solve()` reuses the factorised
-matrix across repeats. The point of the table is the ratio between the
-factorisation and everything else, which is over 99% either way.)
-
-So the factorisation's rank-one update is the only thing worth optimising, and
-the two changes this pass made to `mpp_lu_factorize` both target it:
-
-- **Step 5 streams the pivot row from the contiguous sorted run that step 3
-  already wrote**, instead of walking the entry list again through `nextr`.
-  Same entries, same order, but one sequential stream instead of a pointer
-  chase, and the column and its value arrive together so the inner loop no
-  longer touches the entry workspace.
-- **The loop-invariant `symbolic` test is hoisted out of the inner loop** and
-  the fill branch is split into its own path, so the numeric update is a
-  straight line over the common case.
-
-There is deliberately **no before/after speedup table** here. The comparison this
-port could show would be against a revision of `mpp_lu_factorize` that is not in
-this repository, so neither the "before" nor the "after" column could be
-reproduced by anyone who clones it. The numbers in the table above are the ones
-this repository actually produces today, and `bench/profile_kernels.py` and
-`bench/profile_counts.py` regenerate the stage and iteration-count figures.
-
-`bench/profile_counts.py` counts the step-5 inner loop, which runs once per
-(multiplier, pivot-row-entry) pair:
-
-| case | nnz(L+U) | step-5 inner iterations |
-| --- | --- | --- |
-| dense 200 | 39,800 | 1,313,400 |
-| dense 400 | 159,600 | 10,586,800 |
-| dense 800 | 639,200 | 85,013,600 |
-| laplacian 80x80 | 1,011,358 | 40,192,117 |
-
-One further idea was tried and **reverted**: packing the tag and the entry
-position into a single 64-bit slot so the update probe is one load instead of a
-dependent `wtag` then `wpos`. It was slower at every size, because the slot array
-is the hottest randomly-indexed array in the loop and doubling it to 8 bytes per
-column costs more than the saved load. `bench/probe_scatter.py` records why the
-obvious "just SIMD it" answer does not apply here: the update is a dependent
-scatter (one indirect address per entry), and on this machine's real access shape
-a blocked-SIMD rewrite is not faster than the scalar scatter-gather. Measured on
-the two shapes that matter, an ordered merge beats the stamped probe by only
-1.22x (dense 800) and 1.08x (laplacian 80x80), which is not enough to pay for the
-sorted invariant it would require.
-
-### Why the factorisation is not threaded, and why there is no GPU path
-
-- **Parallelism.** The factorisation is right-looking on the matrix columns, so
-  step `k+1` reads the fill that step `k` produced. The steps are genuinely
-  dependent, so they cannot be spread over `max.algorithm.parallelize` without
-  first changing the schedule to one whose steps are independent (a left-looking
-  Gilbert-Peierls ordering). That is a rewrite of the kernel, not a flag, and it
-  was not attempted here. The triangular solves already use `parallelize`
-  across right-hand sides where that decomposition is valid.
-- **GPU.** The `max.gpu.host` path is available and works on this toolchain:
-  `bench/probe_gpu.py` builds a `DeviceContext`, runs one kernel over 2^20
-  elements with a correct tail, and synchronizes (the probe also confirms the
-  API moved to `max.gpu`; `std.gpu` is gone). It is not shipped because the
-  rank-one update is **0.06 flops per byte** — two flops against roughly 36
-  bytes touched per entry — and, more fundamentally, it is a dependent scatter
-  with a sequential dependency between steps. A GPU does not help a loop whose
-  iterations must run in order and whose arithmetic intensity is an order of
-  magnitude below the point where a GPU wins. That is an algorithmic property,
-  not a missing API.
+This table is the `bench` step of the final `pixi run build && pixi run test &&
+pixi run bench` against this source, so it is the measurement that ships with
+it. Two of the nine comparable cases are faster than upstream MKL PARDISO; the
+median ratio is 2.78x, the best 0.05x, the worst 18.50x. Ratios above 1 are
+losses, stated as they came out.
 
 Reading the table:
 
-- **About 9x faster on the banded case.** A tridiagonal factorisation stays banded,
-  so there is no fill at all and the work reduces to a flat triangular solve. This
-  is the case the port is genuinely good at: no fill, cache-resident rows, one pass.
-- **Roughly level on the small `spsolve` alias case**, which measured 0.79x, 1.28x
-  and 1.01x on three runs, i.e. inside the noise.
-- **Behind on every dense case**, by 1.6x at n=200 rising to 12.5x on the
-  factorisation alone at n=800. MKL's supernodal blocking and threaded BLAS
-  inside a multifrontal solver are a different machine. The gap widens with n
-  because this port's inner loop is a single-threaded scalar rank-one update.
+- **Decisively faster on the banded case.** A tridiagonal factorisation stays
+  banded, so there is no fill at all and the work reduces to a flat triangular
+  solve. This is the case the port is genuinely good at: no fill, cache-resident
+  rows, one pass. It is the one result that has held on every recorded run, and
+  the one where upstream is paying for a general-purpose solver it does not need.
+- **On or near parity on the two smallest cases** — `dense 200x200` (1.37x here,
+  0.36x to 1.37x across runs) and the cached `dense 500x500, 8 rhs` solve (1.27x
+  here, 0.60x to 1.27x across runs). Both have been recorded on both sides of
+  parity. Neither should be read as a result; what is stable is that on these
+  cells both solvers are in the same order of magnitude, unlike every other row.
+  The `spsolve` alias on the 60x60 grid is a third, and a clearer, win: 0.18x
+  here, 0.07x to 0.18x on every run that measured it.
+- **Behind on the larger dense cases.** MKL's supernodal blocking and threaded
+  BLAS inside a multifrontal solver are a different machine. The gap widens with
+  `n` because this port's inner loop is a single-threaded scalar rank-one update.
 - **Behind on the 2D Laplacian**, which is the fill-in story rather than a
   constant-factor story. Under the natural ordering a grid Laplacian produces
-  quadratic fill — `bench/profile_counts.py` measures 1,011,358 factor entries
-  for a matrix with 31,680 nonzeros — and MKL reorders (nested dissection /
-  minimum degree) while this port does not. The same matrix at 60x60 is *level*
-  because it is small enough that the constant wins over the asymptotic penalty.
+  quadratic fill, and MKL reorders (nested dissection / minimum degree) while this
+  port does not. That is the worst row on every run.
 - **Upstream crashed on phase 22** for a dense 800x800 matrix. That is an upstream
   bug, not a measurement failure: `mkl_pardiso` segfaults reproducibly on that
-  path in this MKL build (confirmed twice in a row, dumping core), which is why
-  the bench measures each cell in its own subprocess and reports the crash in the
-  table.
+  path in this MKL build, which is why the bench measures each cell in its own
+  subprocess and reports the crash in the table rather than taking the whole
+  table down with it.
 
-The honest summary: this is a correct, complete, dependency-light
-reimplementation of the algorithm, and it is fast exactly where sparse LU is easy
-— no fill, cache-resident rows. It does not change the conclusion that this port
-loses to MKL wherever fill-in matters. Two further changes would close most of
-that gap and neither is done here: a fill-reducing ordering (minimum degree or
-nested dissection) before the factorisation, and a left-looking schedule whose
-steps are independent enough to thread.
+The honest summary: this is a correct, dependency-light reimplementation of the
+algorithm, and it is fast exactly where sparse LU is easy — no fill,
+cache-resident rows. It does not change the conclusion that this port loses to
+MKL wherever fill-in matters. The two changes that would close most of that gap,
+neither done here, are a fill-reducing ordering (minimum degree or nested
+dissection) before the factorisation, and a left-looking schedule whose steps
+are independent enough to thread.
 
 ## Layout
 
@@ -380,12 +430,12 @@ python/mojo_pypardiso/    ctypes glue and the upstream-compatible Python API
     _lib.py               loads or rebuilds the .so, holds the argtypes table
     pardiso_wrapper.py    PyPardisoSolver, mirroring pypardiso/pardiso_wrapper.py
     scipy_aliases.py      spsolve / factorized, mirroring pypardiso/scipy_aliases.py
-tests/                    pytest; numerical parity against upstream pypardiso
+tests/                    pytest
+    conftest.py           shared fixtures and matrix generators
+    test_api.py           the Python API, compared against upstream by reflection
+    test_parity.py        numerical parity with upstream, scipy, and ground truth
+    test_kernels.py       every exported kernel called by name through ctypes
 bench/bench.py            benchmarks against upstream, prints a markdown table
-bench/profile_kernels.py  per-stage timing of one solve, the optimisation target
-bench/profile_counts.py   how many inner iterations the factorisation performs
-bench/probe_scatter.py    why the update loop is not vectorised
-bench/probe_gpu.py        the max.gpu.host path, and this kernel's intensity
 ```
 
 `src/ported.mojo` reads top-to-bottom in upstream's source order: each section is

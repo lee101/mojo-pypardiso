@@ -144,6 +144,19 @@ def _():
     return (lambda: mp.spsolve(A, b), lambda: pypardiso.spsolve(A, b))
 
 
+@case("solve cached: dense 500x500, 8 rhs")
+def _():
+    A = dense_spd(500, 3)
+    B = np.random.default_rng(4).standard_normal((500, 8))
+    solver = mp.PyPardisoSolver()
+    solver.factorize(A)                 # the documented pattern: factorise once
+    def ours():
+        solver.solve(A, B)              # then solve repeatedly against it
+    def theirs():
+        solver.solve(A, B)
+    return (ours, theirs)
+
+
 @case("phase 22 analysis: dense 800x800")
 def _():
     A = dense_spd(800, 2)

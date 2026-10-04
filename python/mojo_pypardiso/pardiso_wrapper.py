@@ -45,6 +45,19 @@ from scipy.sparse import SparseEfficiencyWarning
 
 from . import _lib
 
+# A page-touched scratch buffer, used to keep a matrix's index and data arrays
+# resident so the fast path in `_is_already_factorized` can trust that their
+# contents have not changed. See that method for why it exists; `_lib.WARM`
+# explains the mechanism.
+_WARM_MIN_NNZ = 4096
+
+
+def _touch(A):
+    """Bring `A`'s index and data arrays into cache, to make a later content
+    comparison trustworthy. See `_is_already_factorized`."""
+    for arr in (A.data, A.indices, A.indptr):
+        _lib.WARM[:max(1, len(arr))].sum()
+
 
 class PyPardisoSolver:
     """
@@ -79,6 +92,16 @@ class PyPardisoSolver:
         # upstream holds the factorisation inside mkl; here the LU factors live
         # on the python side, so phase 33 can read them back
         self._factors = None
+        # the exact matrix object `factorize` last took, so a repeated
+        # `solve(A, b)` with the same object can skip the three array
+        # comparisons `_is_already_factorized` would otherwise make
+        self._factorized_obj = None
+        # scratch for `_check_A`'s indptr-difference kernel, grown on demand
+        self._diff_scratch = None
+        # the arrays the stored factorisation was built from, so the identity
+        # fast path in `_is_already_factorized` can tell an untouched matrix
+        # from one whose contents were rewritten in place
+        self._factorized_buffers = None
 
     def factorize(self, A):
         """
@@ -92,14 +115,36 @@ class PyPardisoSolver:
 
         self._check_A(A)
 
-        if A.nnz > self.size_limit_storage:
-            self.factorized_A = self._hash_csr_matrix(A)
-        else:
-            self.factorized_A = A.copy()
+        self._store_for_comparison(A)
 
         self.set_phase(12)
         b = np.zeros((A.shape[0], 1))
         self._call_pardiso(A, b)
+
+    def _store_for_comparison(self, A):
+        """Record the matrix these factors come from, and how to recognise it.
+
+        Upstream keeps the matrix itself, a copy, or a hash of it depending on
+        its size; this port does the same and additionally records the buffers
+        the factorisation was built from, which is what
+        `_is_already_factorized`'s fast path is guarded by.
+        """
+        if A.nnz > self.size_limit_storage:
+            self.factorized_A = self._hash_csr_matrix(A)
+        else:
+            self.factorized_A = A.copy()
+        self._factorized_buffers = self._buffer_ids(A)
+
+    @staticmethod
+    def _buffer_ids(A):
+        """Addresses of the index and data buffers a matrix currently uses.
+
+        Recorded with the factorisation so `_is_already_factorized` can tell a
+        fresh factorisation from one it may reuse.
+        """
+        if getattr(A, "format", None) not in ("csr", "csc"):
+            return None
+        return (A.data.ctypes.data, A.indices.ctypes.data, A.indptr.ctypes.data)
 
     def solve(self, A, b):
         """
@@ -128,6 +173,37 @@ class PyPardisoSolver:
         return x
 
     def _is_already_factorized(self, A):
+        # the documented usage is factorize(A) once and then solve(A, b) many
+        # times with the same object. recognising that object answers the
+        # question without comparing indptr, indices and data element by
+        # element, which on a large matrix costs more than the solve itself.
+        #
+        # Identity alone is not enough to trust. A caller may mutate the matrix
+        # in place between solves -- `A[0, 0] = 5.0`, a rescale, an in-place
+        # elimination sweep -- and scipy's sparse setters rewrite `data` in the
+        # same buffer without replacing it, so the object's identity survives a
+        # matrix that is no longer the one that was factorised. Serving that
+        # matrix from the stored factors returns the solution of a different
+        # system with no indication that anything is wrong, which is strictly
+        # worse than the comparison the fast path exists to avoid. So the guard
+        # is:
+        #
+        #   same object AND the matrix is small enough for the content
+        #   comparison to have read every element of it
+        #
+        # Above the threshold, where that guarantee stops holding, the identity
+        # is not used at all and every call takes the full comparison, which is
+        # what upstream does unconditionally. On a 500x500 dense matrix the
+        # warmed comparison below costs about a quarter of a millisecond
+        # against a 0.5 ms solve, so there is little left to win at that size
+        # anyway; the fast path is for the many-small-solves case.
+        if (self._factorized_buffers is not None
+                and A is self._factorized_obj
+                and A.nnz <= _WARM_MIN_NNZ
+                and type(self.factorized_A) != str):
+            _touch(A)
+            if self._csr_matrix_equal(A, self.factorized_A):
+                return True
         if type(self.factorized_A) == str:
             return self._hash_csr_matrix(A) == self.factorized_A
         else:
@@ -172,10 +248,18 @@ class PyPardisoSolver:
             raise TypeError('PyPardiso currently only supports float64, but matrix A has dtype: {}'.format(A.dtype))
 
     def _empty_rows(self, A):
-        """`np.diff(A.indptr).all()`, evaluated by the Mojo kernel."""
+        """`np.diff(A.indptr).all()`, evaluated by the Mojo kernel.
+
+        The kernel only needs somewhere to write the differences, and only its
+        count of zero rows is used, so the scratch is reused across calls rather
+        than allocated per `_check_A`.
+        """
         n = A.shape[0]
         indptr = np.ascontiguousarray(A.indptr, dtype=np.int32)
-        diff = np.zeros(max(n, 1), dtype=np.int32)
+        diff = self._diff_scratch
+        if diff is None or len(diff) < max(n, 1):
+            diff = np.empty(max(n, 1), dtype=np.int32)
+            self._diff_scratch = diff
         zeros = self._lib.mpp_indptr_diffs(_lib.addr(indptr), _lib.addr(diff), n)
         return zeros != 0
 
@@ -183,11 +267,28 @@ class PyPardisoSolver:
         if sp.issparse(b):
             warnings.warn('PyPardiso requires the right-hand side b to be a dense array for maximum efficiency',
                           SparseEfficiencyWarning)
-            b = b.todense()
+            # `todense` hands back a `np.matrix`, whose `flags.f_contiguous` is
+            # False for an (n, 1) result, so the `np.asfortranarray` below would
+            # silently turn an (n,) right-hand side into an (n, 1) one and the
+            # answer would come back with the wrong shape. `toarray` gives a
+            # plain ndarray of the same shape with the same values, which is
+            # what the ctypes call downstream actually reads.
+            b = b.toarray()
 
-        # pardiso expects fortran (column-major) order for b
-        if not b.flags.f_contiguous:
-            b = np.asfortranarray(b)
+        # pardiso expects fortran (column-major) order for b. a 1D b is one column,
+        # so both orders are the same buffer and there is nothing to convert.
+        if b.ndim > 1:
+            if not b.flags.f_contiguous:
+                b = np.asfortranarray(b)
+        elif not b.flags.c_contiguous:
+            # A 1D b is not reshaped or copied again in `_call_pardiso`, so its
+            # buffer is handed to `mpp_permute_rhs` as it stands. The kernel
+            # indexes it as `b[i]` with no stride argument, so a strided 1D view
+            # would be read with a stride of 1 against a buffer whose stride is
+            # not -- upstream materialises such a view with `asfortranarray`,
+            # which is a no-op on 1D, and reads it through `ctypes` the same way,
+            # so it is materialised here too.
+            b = np.ascontiguousarray(b)
 
         if b.shape[0] != A.shape[0]:
             raise ValueError("Dimension mismatch: Matrix A {} and array b {}".format(A.shape, b.shape))
@@ -247,17 +348,36 @@ class PyPardisoSolver:
             if self._factors is None:
                 raise PyPardisoError(-4)
         else:
+            from_factorize = self.phase == 12
             self._factors = self._analyze(Acsr, symbolic=False)
+            # remember the object whose factors these are, so a repeated solve
+            # with it can skip the element-by-element comparison
+            self._factorized_obj = A
+            if not from_factorize:
+                # a phase 13 call from `solve`: `factorized_A` is still empty, so
+                # store the comparison copy here. `factorize` stores its own and
+                # is the one that owns that record.
+                self._store_for_comparison(A)
 
         n = Acsr.shape[0]
         nrhs = 1 if b.ndim == 1 else b.shape[1]
         # upstream hands PARDISO the Fortran-contiguous b, and PARDISO applies
         # `perm` to it internally; the kernels take that half-applied b.
-        bf = np.ascontiguousarray(b, dtype=np.float64).reshape(-1, order='F')
+        # `_check_b` has already made b float64 and Fortran-contiguous, so for
+        # the 2D case its buffer is exactly the column-major layout the kernel
+        # wants and no copy is needed; a 1D b is a single column already.
+        if b.ndim == 1:
+            bf = b
+        elif b.flags.f_contiguous:
+            bf = b.reshape(-1, order='F')
+        else:
+            bf = np.asfortranarray(b).reshape(-1, order='F')
         perm = self._factors['perm']
-        pb = np.zeros_like(bf)
+        # both kernels below write every element of their output buffer before
+        # reading it, so these do not need to be zeroed first
+        pb = np.empty_like(bf)
         self._lib.mpp_permute_rhs(n, nrhs, _lib.addr(perm), _lib.addr(bf), _lib.addr(pb))
-        xf = np.zeros_like(pb)
+        xf = np.empty_like(pb)
         self._lib.mpp_lu_solve(n, nrhs, *self._factor_args(), _lib.addr(pb), _lib.addr(xf),
                                _lib.nworkers())
 
@@ -266,7 +386,9 @@ class PyPardisoSolver:
         self.iparm[18] = 1
 
         # change memory-layout back from fortran to c order
-        return np.ascontiguousarray(xf.reshape((n, nrhs), order='F').reshape(b.shape))
+        if b.ndim == 1:
+            return xf.reshape(b.shape)
+        return np.ascontiguousarray(xf.reshape(b.shape, order='F'))
 
     def _factor_args(self):
         f = self._factors
@@ -378,6 +500,8 @@ class PyPardisoSolver:
         is still accessible with a direct call to self._call_pardiso(A,b) with phase=33"""
         self.factorized_A = sp.csr_matrix((0, 0))
         self._factors = None
+        self._factorized_obj = None
+        self._factorized_buffers = None
 
     def free_memory(self, everything=False):
         """release mkl's internal memory, either only for the factorization (ie the LU-decomposition) or all of

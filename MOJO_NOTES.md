@@ -8,14 +8,13 @@ toolchain bump rather than trusting this file.
 
 ## Pin note for this repo (mojo-pypardiso)
 
-This repo pins `mojo ==1.2.0.dev2026092605` / `max ==26.7.0.dev2026092605`, not
-the `...905` marker above. A `max` nightly of a given day only has builds for
-Python 3.10, 3.11, 3.12, 3.13 and 3.14, and `max-core` pins `mojo-compiler`
-exactly, so a `mojo` pin newer than the matching `max` is unsolvable — it comes
-back as `mojo-compiler ... conflicts with the versions reported above`. Pinning
-`mojo` to a newer day than `max` fails the install outright. `2026092605` is the
-newest pair with a Python 3.13 build and matches every sibling repo. Nothing in
-the dialect notes below depends on the patch number.
+This repo pins `mojo ==1.2.0.dev2026092905` / `max ==26.7.0.dev2026092905`, which
+is the marker pair in the header above. A `max` nightly of a given day only has
+builds for Python 3.10, 3.11, 3.12, 3.13 and 3.14, and `max-core` pins
+`mojo-compiler` exactly, so a `mojo` pin whose day has no matching `max` release is
+unsolvable — it comes back as `mojo-compiler ... conflicts with the versions
+reported above`. Pinning `mojo` to a newer day than `max` fails the install
+outright. Nothing in the dialect notes below depends on the patch number.
 
 ## 0. Two things that break everything if you forget them
 

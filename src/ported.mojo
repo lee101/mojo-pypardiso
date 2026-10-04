@@ -65,12 +65,15 @@ def mpp_indptr_diffs(indptr: Int, diff: Int, n: Int) abi("C") -> Int:
     is singular, and on the CSC path (which is PARDISO's `iparm(12) = 1`) the
     same test on the CSC arrays finds an empty column instead.
     """
+    # the difference is kept in a local instead of being reloaded out of `d`
+    # on the very next line, which is what this loop used to do
     var ip = iptr(indptr)
     var d = iptr(diff)
     var zero = 0
     for i in range(n):
-        d.unsafe_store(i, ip.unsafe_load(i + 1) - ip.unsafe_load(i))
-        if d.unsafe_load(i) == 0:
+        var diff = ip.unsafe_load(i + 1) - ip.unsafe_load(i)
+        d.unsafe_store(i, diff)
+        if diff == 0:
             zero += 1
     return zero
 
@@ -532,7 +535,14 @@ def mpp_lu_solve(
 
     def solve_rhs(r: Int) {imm}:
         var off = r * n
-        # L is unit lower triangular: y[j] = Pb[j] - sum(L[j, i] * y[i], i < j)
+        # L is unit lower triangular: y[j] = Pb[j] - sum(L[j, i] * y[i], i < j).
+        #
+        # Both `L` and `u_diag` are indexed by PIVOT position, which is what
+        # `mpp_lu_factorize` wrote them in: row `k` of each is the row that was
+        # pivoted to position `k`, and `perm[k]` is the original label of that
+        # row. `perm` is a label lookup and is not an index into either array.
+        # `rhead`/`up`/`ud` were all written under that same index, so reading
+        # them by `perm[j]` instead mixes two different orderings up.
         for j in range(n):
             var s = bv.unsafe_load(off + j)
             for t in range(lp.unsafe_load(j), lp.unsafe_load(j + 1)):

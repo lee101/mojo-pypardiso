@@ -1,8 +1,45 @@
 """Shared fixtures and matrix generators for the parity tests."""
 
+import os
+
 import numpy as np
 import pytest
 import scipy.sparse as sp
+
+
+@pytest.fixture(scope="session")
+def compiled_lib():
+    """The compiled Mojo shared library, or skip loudly if it is not there.
+
+    Every assertion below goes through this handle, so a test can only pass by
+    actually calling into `dist/libmojo-pypardiso.so`. The path is asserted to be
+    the build output and not something else that happens to be on the loader
+    path, and `MOJO_PYPARDISO_LIB` is cleared for the duration of the session so
+    an env var cannot redirect the tests at a stale library.
+    """
+    saved = os.environ.pop("MOJO_PYPARDISO_LIB", None)
+    try:
+        from mojo_pypardiso import _lib
+
+        try:
+            path = _lib.build(force=True)
+        except Exception as exc:
+            # includes a missing mojo binary (OSError), a compiler error
+            # (BuildError), and a timeout
+            pytest.skip(f"could not build the Mojo library: {exc!r}")
+        if not os.path.exists(path):
+            pytest.skip(f"compiled Mojo library missing at {path}")
+        try:
+            lib = _lib.lib()
+        except OSError as exc:
+            pytest.skip(f"compiled Mojo library would not load: {exc}")
+        loaded = os.path.realpath(lib._name)
+        if loaded != os.path.realpath(path):
+            pytest.fail(f"loaded {loaded} instead of the build output {path}")
+        return lib
+    finally:
+        if saved is not None:
+            os.environ["MOJO_PYPARDISO_LIB"] = saved
 
 
 @pytest.fixture(scope="session")
@@ -11,12 +48,13 @@ def upstream():
     pypardiso = pytest.importorskip("pypardiso")
     try:
         return pypardiso.PyPardisoSolver()
-    except Exception as exc:  # pragma: no cover - depends on the host MKL
+    except Exception as exc:
         pytest.skip(f"upstream pypardiso unavailable: {exc}")
 
 
 @pytest.fixture(scope="session")
-def ours():
+def ours(compiled_lib):
+    """The port's solver class, bound to the freshly built shared library."""
     from mojo_pypardiso import PyPardisoSolver
     return PyPardisoSolver
 

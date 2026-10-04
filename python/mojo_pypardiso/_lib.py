@@ -8,6 +8,8 @@ import shutil
 import subprocess
 import sys
 
+import numpy as np
+
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SRC = os.path.join(ROOT, "src")
 LIB = os.environ.get("MOJO_PYPARDISO_LIB") or os.path.join(
@@ -18,18 +20,33 @@ I = ctypes.c_int32
 A = ctypes.c_void_p
 I64 = ctypes.c_int64
 
-# Every `@export`ed kernel, in the order `src/ported.mojo` declares them.
+# Every `@export`ed kernel, in the order `src/ported.mojo` declares them. The
+# widths are checked against the kernel sources by
+# `tests/test_kernels.py::test_ctypes_argtypes_match_the_declared_kernel_signatures`,
+# so a kernel that gains a parameter without a matching table entry fails there
+# rather than silently truncating the call.
 _SIGNATURES = {
     "mpp_indptr_diffs": ([A, A, I64], I),
-    "mpp_csr_transpose": ([A] * 7 + [I64] * 2, I),
+    # `n` and `nnz` are counts; `cursor` is a buffer address, and the kernel
+    # declares it `Int` like every other address because `@export` has no
+    # pointer type to hand it
+    "mpp_csr_transpose": ([A] * 6 + [I64, I64, A], I),
     "mpp_permute_rhs": ([I64, I64] + [A] * 3, None),
     "mpp_lu_factorize": ([I64] * 3 + [A] * 26, I),
-    "mpp_lu_solve": ([I64] * 2 + [A] * 8 + [I64], None),
+    "mpp_lu_solve": ([I64] * 2 + [A] * 9 + [I64], None),
 }
 
 
 class BuildError(RuntimeError):
     pass
+
+
+# A page-touched scratch buffer. `_is_already_factorized` walks a matrix's index
+# and data arrays before comparing them, so that the comparison which follows is
+# reading the same bytes the kernel will; see that method for why the walk has to
+# happen at all. Sized as a slice, so only the prefix covering the matrix is ever
+# touched.
+WARM = np.zeros(1 << 22, dtype=np.uint8)
 
 
 def mojo_command() -> list[str]:

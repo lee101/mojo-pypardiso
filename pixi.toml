@@ -17,10 +17,10 @@ bench-nolock = "python bench/bench.py"
 PYTHONPATH = "python"
 
 [dependencies]
-mojo = "==1.2.0.dev2026092605"
+mojo = "==1.2.0.dev2026092905"
 python = "3.13.*"
 pytest = "*"
 numpy = "*"
 scipy = "*"
 pypardiso = "*"
-max = "==26.7.0.dev2026092605"
+max = "==26.7.0.dev2026092905"
