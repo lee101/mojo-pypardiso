@@ -48,6 +48,11 @@ class BuildError(RuntimeError):
 # touched.
 WARM = np.zeros(1 << 22, dtype=np.uint8)
 
+# See `nworkers()`. Eight is well past the point where the per-right-hand-side
+# decomposition stops paying, and keeps the thread pool small enough that a
+# loaded host can still create it.
+_MAX_WORKERS = 8
+
 
 def mojo_command() -> list[str]:
     override = os.environ.get("MOJO_PYPARDISO_MOJO")
@@ -103,11 +108,23 @@ def addr(a) -> int:
 
 
 def nworkers() -> int:
-    """Worker count handed to the kernels that spread work over threads."""
+    """Worker count handed to the kernels that spread work over threads.
+
+    Capped well below `os.cpu_count()`. The solve kernel launches a MAX thread
+    pool, and a pool sized to every logical CPU on a large, shared machine can
+    fail `pthread_create` when the host is already near its thread limit -- and
+    the MAX runtime answers that by calling `abort()`, which takes the whole
+    Python process down rather than returning an error the solver could fall
+    back from. A large worker count also buys almost nothing here: there is one
+    work item per right-hand side, so the win saturates long before the core
+    count does.
+
+    `MOJO_PYPARDISO_THREADS=1` forces the serial path.
+    """
     env = os.environ.get("MOJO_PYPARDISO_THREADS")
     if env:
         return max(1, int(env))
-    return max(1, os.cpu_count() or 1)
+    return max(1, min(os.cpu_count() or 1, _MAX_WORKERS))
 
 
 def main() -> int:

@@ -9,7 +9,11 @@ import scipy.sparse as sp
 
 @pytest.fixture(scope="session")
 def compiled_lib():
-    """The compiled Mojo shared library, or skip loudly if it is not there.
+    """The compiled Mojo library, or fail loudly if it cannot be produced.
+    A missing toolchain skips, because the kernel assertions cannot run without
+    it. A toolchain that IS present and then fails the build is a different
+    thing: that is a broken source, and skipping it would let `pixi run test`
+    exit 0 with every kernel assertion unrun.
 
     Every assertion below goes through this handle, so a test can only pass by
     actually calling into `dist/libmojo-pypardiso.so`. The path is asserted to be
@@ -25,14 +29,17 @@ def compiled_lib():
             path = _lib.build(force=True)
         except Exception as exc:
             # includes a missing mojo binary (OSError), a compiler error
-            # (BuildError), and a timeout
-            pytest.skip(f"could not build the Mojo library: {exc!r}")
+            # (BuildError), and a timeout. Only the first of those is a
+            # missing toolchain; anything else is a real build failure.
+            if not _toolchain_present():
+                pytest.skip(f"could not build the Mojo library: {exc!r}")
+            pytest.fail(f"could not build the Mojo library: {exc!r}")
         if not os.path.exists(path):
-            pytest.skip(f"compiled Mojo library missing at {path}")
+            pytest.fail(f"compiled Mojo library missing at {path}")
         try:
             lib = _lib.lib()
         except OSError as exc:
-            pytest.skip(f"compiled Mojo library would not load: {exc}")
+            pytest.fail(f"compiled Mojo library would not load: {exc}")
         loaded = os.path.realpath(lib._name)
         if loaded != os.path.realpath(path):
             pytest.fail(f"loaded {loaded} instead of the build output {path}")
@@ -40,6 +47,25 @@ def compiled_lib():
     finally:
         if saved is not None:
             os.environ["MOJO_PYPARDISO_LIB"] = saved
+
+
+def _toolchain_present():
+    """Whether a `mojo` compiler is reachable at all, ignoring its exit status.
+
+    Decides whether a build failure means "no toolchain here" (skip) or "the
+    source does not compile" (fail). Deliberately only looks for the binary:
+    `mojo_command()` raising `BuildError` is the absence case, and a binary
+    that exists but cannot be forked is a failure worth reporting.
+    """
+    from mojo_pypardiso import _lib
+
+    if os.environ.get("MOJO_PYPARDISO_MOJO"):
+        return True
+    try:
+        _lib.mojo_command()
+    except Exception:
+        return False
+    return True
 
 
 @pytest.fixture(scope="session")

@@ -27,14 +27,18 @@ import pypardiso  # noqa: E402
 
 
 def timeit(fn, repeat: int = 3):
-    """Best of `repeat` wall-clock seconds; returns None if the call fails."""
+    """Best of `repeat` wall-clock seconds.
+
+    Raises whatever `fn` raised on its first attempt. An earlier version
+    returned `None` and the caller reported every `None` as "crashed", which
+    made a plain Python exception indistinguishable from a segfault in the
+    table -- the reader could not tell which side of the comparison was
+    actually broken.
+    """
     best = math.inf
     for _ in range(repeat):
         t0 = time.perf_counter()
-        try:
-            fn()
-        except Exception:
-            return None
+        fn()
         best = min(best, time.perf_counter() - t0)
     return best
 
@@ -148,12 +152,16 @@ def _():
 def _():
     A = dense_spd(500, 3)
     B = np.random.default_rng(4).standard_normal((500, 8))
-    solver = mp.PyPardisoSolver()
-    solver.factorize(A)                 # the documented pattern: factorise once
+    ours_solver = mp.PyPardisoSolver()
+    ours_solver.factorize(A)           # the documented pattern: factorise once
+    theirs_solver = pypardiso.PyPardisoSolver()
+    theirs_solver.factorize(A)
+
     def ours():
-        solver.solve(A, B)              # then solve repeatedly against it
+        ours_solver.solve(A, B)        # then solve repeatedly against it
+
     def theirs():
-        solver.solve(A, B)
+        theirs_solver.solve(A, B)
     return (ours, theirs)
 
 
@@ -190,7 +198,7 @@ def machine():
 # these paths (phase 22 on a dense matrix does, reproducibly, in this MKL
 # build), and a crash in one cell must not take the whole table with it.
 CHILD = """
-import json, sys
+import json, sys, traceback
 sys.path.insert(0, "bench")
 sys.path.insert(0, "python")
 import numpy as np
@@ -200,13 +208,22 @@ index, which = int(sys.argv[1]), sys.argv[2]
 name, build = B.CASES[index]
 ours, theirs = build()
 fn = ours if which == "ours" else theirs
-seconds = B.timeit(fn)
-print("@@RESULT@@" + json.dumps(seconds))
+try:
+    seconds = B.timeit(fn)
+    print("@@RESULT@@" + json.dumps([seconds, None]))
+except BaseException:
+    # an exception, not a signal: the process is still alive and can report it
+    print("@@RESULT@@" + json.dumps([None, traceback.format_exc()[-400:]]))
 """
 
 
 def measure(index, which):
-    """Best-of-N seconds for one cell, or None if it failed or crashed."""
+    """Best-of-N seconds for one cell.
+
+    Returns `(seconds, error)`: exactly one is None. `error` is the traceback
+    when the child raised, `""` when it died on a signal, and None when the
+    child produced no result at all.
+    """
     env = dict(os.environ)
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     try:
@@ -214,12 +231,13 @@ def measure(index, which):
             [sys.executable, "-c", CHILD, str(index), which],
             cwd=root, env=env, capture_output=True, text=True, timeout=1800)
     except subprocess.TimeoutExpired:
-        return None
+        return None, "timed out"
     for line in proc.stdout.splitlines():
         if line.startswith("@@RESULT@@"):
-            value = json.loads(line[len("@@RESULT@@"):])
-            return value
-    return None
+            seconds, error = json.loads(line[len("@@RESULT@@"):])
+            return seconds, error
+    # no marker at all: the child died on a signal (a segfault prints nothing)
+    return None, ""
 
 
 def main():
@@ -229,19 +247,30 @@ def main():
     print("| --- | --- | --- | --- |")
     rows = []
     for index, (name, _) in enumerate(CASES):
-        t_ours = measure(index, "ours")
-        t_theirs = measure(index, "theirs")
+        t_ours, err_ours = measure(index, "ours")
+        t_theirs, err_theirs = measure(index, "theirs")
 
         def fmt(t):
             return "-" if t is None else f"{t*1e3:.2f} ms"
 
+        def cell(t, err):
+            # "crashed" is a death by signal, which prints no traceback;
+            # "error" is a Python exception the child was able to report. They
+            # are different failures and the table says which is which.
+            if t is not None:
+                return fmt(t)
+            if err == "":
+                return "crashed"
+            if err:
+                return "error"
+            return "no result"
+
         if t_ours is None or t_theirs is None:
-            if t_ours is None:
-                ours_cell = "failed"
-            else:
-                ours_cell = fmt(t_ours)
-            theirs_cell = "crashed" if t_theirs is None else fmt(t_theirs)
-            print(f"| {name} | {ours_cell} | {theirs_cell} | - |")
+            print(f"| {name} | {cell(t_ours, err_ours)} | "
+                  f"{cell(t_theirs, err_theirs)} | - |")
+            for err in (err_ours, err_theirs):
+                if err:
+                    print(f"<!-- {name}: {err.strip()[-300:]} -->")
             rows.append((name, t_ours, t_theirs, None))
             continue
         ratio = t_ours / t_theirs

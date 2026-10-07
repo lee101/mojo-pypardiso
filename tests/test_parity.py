@@ -115,6 +115,36 @@ def test_threaded_solve_matches_serial_solve(ours):
     assert np.abs(threaded - serial).max() == 0.0
 
 
+def test_default_worker_count_is_capped_and_overridable(monkeypatch):
+    """The default worker count must stay bounded, and the env override must win.
+
+    `mpp_lu_solve` launches a MAX thread pool. The MAX runtime aborts the whole
+    process when `pthread_create` fails, so a pool sized to every logical CPU
+    on a large loaded host kills Python outright rather than returning an error
+    the solver could fall back from. The cap is what prevents that, so it is
+    pinned here rather than left as a tuning constant nobody re-checks.
+    """
+    import os
+
+    from mojo_pypardiso import _lib
+
+    monkeypatch.delenv("MOJO_PYPARDISO_THREADS", raising=False)
+    default = _lib.nworkers()
+    assert 1 <= default <= _lib._MAX_WORKERS
+
+    monkeypatch.setenv("MOJO_PYPARDISO_THREADS", "1")
+    assert _lib.nworkers() == 1
+
+    monkeypatch.setenv("MOJO_PYPARDISO_THREADS", "3")
+    assert _lib.nworkers() == 3
+
+    # the override is validated, not passed straight through: a nonsense value
+    # would otherwise reach the kernel as a zero worker count
+    monkeypatch.setenv("MOJO_PYPARDISO_THREADS", "0")
+    assert _lib.nworkers() == 1
+    assert os.cpu_count() is None or os.cpu_count() >= 1
+
+
 def test_csc_input_matches_csr_input(ours, upstream):
     """`_check_A`'s CSC branch: the explicit transposition is the same system."""
     A = csr(dense_spd(40, 15))

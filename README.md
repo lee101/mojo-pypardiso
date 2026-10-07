@@ -308,12 +308,17 @@ pixi run test
   and columns, dimension mismatch, unsupported dtype, singular matrix, phase 33
   with no stored factorisation.
 
-**The tests cannot pass without the compiled library.** Every test is gated on a
-`compiled_lib` fixture that force-rebuilds `src/ported.mojo`, asserts the loaded
-`CDLL` really is `dist/libmojo-pypardiso.so`, and `pytest.skip`s loudly if the
-build fails or the `.so` is absent. Pointing the toolchain at a missing compiler
-turns almost all of the tests into skips with the reason printed, rather than
-letting a pure-Python path satisfy them:
+**A build failure fails the run; only a missing toolchain skips it.** Every test
+is gated on a `compiled_lib` fixture that force-rebuilds `src/ported.mojo` and
+asserts the loaded `CDLL` really is `dist/libmojo-pypardiso.so`. Those two
+conditions are what stop a pure-Python path from satisfying a kernel claim.
+
+The fixture distinguishes two ways the library can be unavailable. If there is
+no `mojo` compiler at all, there is nothing to assert against and the tests
+`skip` with the reason printed. If a compiler *is* present and the build then
+fails, the fixture `fail`s. That distinction matters: an earlier version
+skipped on both, so a source that does not compile produced `exit 0` with every
+kernel assertion unrun -- a green run that proved nothing.
 
 ```
 $ MOJO_PYPARDISO_MOJO=/nonexistent/mojo pixi run test
